@@ -9,7 +9,17 @@ import numpy as np
 import neat
 import pygame
 
-from racing import Car, nearest_point_on_polyline, prepare_segments, raycast_batch
+from racing import (
+    Car,
+    nearest_point_on_polyline,
+    prepare_segments,
+    raycast_batch,
+    lookahead_centerline_points,
+)
+
+N_LOOKAHEAD = 8
+LOOKAHEAD_STRIDE = 5
+LOOKAHEAD_SCALE = 50.0
 
 def world_bbox(points_list):
     P = np.vstack(points_list)
@@ -43,7 +53,19 @@ def observe(car, center, widths, left, right, seg_pack):
         dvec = np.array([math.cos(car.heading + ang), math.sin(car.heading + ang)], dtype=np.float32)
         ray_lines.append((pos, pos + dvec*dlen))
 
-    obs = np.array(list(ray_vals) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))], dtype=float)
+    lookahead = lookahead_centerline_points(
+        center,
+        i,
+        pos,
+        car.heading,
+        n_lookahead=N_LOOKAHEAD,
+        stride=LOOKAHEAD_STRIDE,
+        scale=LOOKAHEAD_SCALE,
+    )
+    obs = np.array(
+        list(ray_vals) + list(lookahead) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))],
+        dtype=float,
+    )
     return obs, i, ray_lines
 
 def main():
@@ -111,6 +133,11 @@ def main():
                 elif e.key == pygame.K_ESCAPE: running=False
 
         obs, idx, ray_lines = observe(car, center, widths, left, right, seg_pack)
+        expected_inputs = len(net.input_nodes)
+        if len(obs) > expected_inputs:
+            obs = obs[:expected_inputs]
+        elif len(obs) < expected_inputs:
+            obs = np.pad(obs, (0, expected_inputs - len(obs)), mode="constant", constant_values=0.0)
         steer, gas, brake = net.activate(obs)
         steer = float(np.clip(steer, -1.0, 1.0))
         gas   = float(np.clip((gas+1)/2, 0.0, 1.0))
