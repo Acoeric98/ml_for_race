@@ -18,6 +18,29 @@ except Exception:
 
 # ---------------- Geometry helpers ----------------
 
+def lookahead_centerline_points(center, nearest_idx, car_pos, car_heading,
+                                n_lookahead=8, stride=5, scale=50.0):
+    """
+    Compute lookahead centerline points in the car's local frame.
+
+    Returns flat array: [x1, y1, x2, y2, ...] normalized by `scale`.
+    """
+    center = _np.asarray(center, dtype=float)
+    pos = _np.asarray(car_pos, dtype=float)
+    n = len(center)
+    out = _np.zeros((n_lookahead, 2), dtype=_np.float32)
+    cos_h = math.cos(car_heading)
+    sin_h = math.sin(car_heading)
+    for k in range(n_lookahead):
+        idx = (nearest_idx + (k + 1) * stride) % n
+        dx, dy = center[idx] - pos
+        # rotate into car frame (heading forward = +x)
+        x_local = cos_h * dx + sin_h * dy
+        y_local = -sin_h * dx + cos_h * dy
+        out[k, 0] = x_local / scale
+        out[k, 1] = y_local / scale
+    return out.reshape(-1)
+
 def catmull_rom_spline(P, samples_per_seg=20, alpha=0.5):
     """Closed Catmull–Rom (centripetal) through P (N x 2)."""
     P = _np.asarray(P, dtype=float)

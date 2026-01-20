@@ -17,7 +17,14 @@ import pygame
 import pickle
 
 # Environment module (does NOT init pygame on import)
-from racing import Car, generate_urban_gp, nearest_point_on_polyline, prepare_segments, raycast_batch
+from racing import (
+    Car,
+    generate_urban_gp,
+    nearest_point_on_polyline,
+    prepare_segments,
+    raycast_batch,
+    lookahead_centerline_points,
+)
 
 # ------------ optional native file dialog (tkinter) ------------
 def pick_pkl_file():
@@ -146,7 +153,17 @@ def build_observation(car, center, widths, left, right, rays_deg, seg_pack, max_
 
     ax_np, ay_np, sx_np, sy_np = seg_pack
     ray_vals = raycast_batch(pts, dirs, ax_np, ay_np, sx_np, sy_np, max_range=max_range)
-    return np.array(list(ray_vals) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))], dtype=float)
+    lookahead = lookahead_centerline_points(
+        center,
+        i,
+        pos,
+        car.heading,
+        n_lookahead=8,
+        stride=5,
+        scale=50.0,
+    )
+    obs = list(ray_vals) + list(lookahead) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))]
+    return np.array(obs, dtype=float)
 
 # ---------------- Physics helper ----------------
 def step_car(car, center, widths, left, right, steer, gas, brake, dt):

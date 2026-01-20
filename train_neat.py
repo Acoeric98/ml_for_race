@@ -10,7 +10,14 @@ import os, time, math, json, csv, argparse, pickle
 import numpy as np
 import neat
 
-from racing import Car, generate_urban_gp, nearest_point_on_polyline, prepare_segments, raycast_batch
+from racing import (
+    Car,
+    generate_urban_gp,
+    nearest_point_on_polyline,
+    prepare_segments,
+    raycast_batch,
+    lookahead_centerline_points,
+)
 
 # ---- Scoring constants (aggressive) ----
 V_REF  = 28.0   # ~100+ km/h target
@@ -26,7 +33,10 @@ EARLY_KO_TIME  = 1.5   # s
 OFF_KO         = 8.0   # m
 
 # ---- Sensor set ----
-RAYS_DEG = [-60, -35, -15, 0, 15, 35, 60]  # 7 rays -> 10 inputs incl. speed/heading/lateral
+RAYS_DEG = [-60, -35, -15, 0, 15, 35, 60]  # 7 rays + lookahead + speed/heading/lateral
+N_LOOKAHEAD = 8
+LOOKAHEAD_STRIDE = 5
+LOOKAHEAD_SCALE = 50.0
 
 def build_observation(car, center, widths, left, right, seg_pack):
     pos = np.array([car.x, car.y], dtype=np.float32)
@@ -46,7 +56,17 @@ def build_observation(car, center, widths, left, right, seg_pack):
 
     ax_np, ay_np, sx_np, sy_np = seg_pack
     ray_vals = raycast_batch(pts, dirs, ax_np, ay_np, sx_np, sy_np, max_range=150.0)
-    return np.array(list(ray_vals) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))], dtype=float)
+    lookahead = lookahead_centerline_points(
+        center,
+        i,
+        pos,
+        car.heading,
+        n_lookahead=N_LOOKAHEAD,
+        stride=LOOKAHEAD_STRIDE,
+        scale=LOOKAHEAD_SCALE,
+    )
+    obs = list(ray_vals) + list(lookahead) + [speed, heading_err, float(np.clip(lateral, -1.0, 1.0))]
+    return np.array(obs, dtype=float)
 
 def eval_one_genome(genome, config, track, max_time=12.0):
     net = neat.nn.FeedForwardNetwork.create(genome, config)
@@ -63,6 +83,11 @@ def eval_one_genome(genome, config, track, max_time=12.0):
 
     for _ in range(int(max_time / dt)):
         obs = build_observation(car, center, widths, left, right, seg_pack)
+        expected_inputs = len(net.input_nodes)
+        if len(obs) > expected_inputs:
+            obs = obs[:expected_inputs]
+        elif len(obs) < expected_inputs:
+            obs = np.pad(obs, (0, expected_inputs - len(obs)), mode="constant", constant_values=0.0)
         steer, gas, brake = net.activate(obs)
         steer = float(np.clip(steer, -1.0, 1.0))
         gas   = float(np.clip((gas+1)/2, 0.0, 1.0))
@@ -116,6 +141,31 @@ def make_track(seed):
     T = generate_urban_gp(seed=seed)
     return {"seed": seed, "center": T["center"], "left": T["left"], "right": T["right"], "widths": T["widths"]}
 
+def _sample_track_seeds(genome_key, base_seed, gen_idx, num_tracks, seed_range):
+    seed_val = (base_seed + gen_idx * 1000003 + int(genome_key)) & 0xFFFFFFFF
+    rng = np.random.default_rng(seed_val)
+    return rng.integers(0, seed_range, size=num_tracks, endpoint=False).tolist()
+
+EVAL_CONTEXT = {}
+
+def eval_genome_multi(genome, config):
+    ctx = EVAL_CONTEXT
+    if ctx.get("fixed_track"):
+        tracks = [ctx["fixed_track"]]
+    else:
+        seeds = _sample_track_seeds(
+            genome.key,
+            ctx["base_seed"],
+            ctx["gen_idx"],
+            ctx["train_seeds_per_gen"],
+            ctx["seed_range"],
+        )
+        tracks = [make_track(seed=s) for s in seeds]
+    scores = []
+    for track in tracks:
+        scores.append(eval_one_genome(genome, config, track, max_time=ctx["max_time"]))
+    return float(np.mean(scores)) if scores else 0.0
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="neat_config.ini")
@@ -128,6 +178,10 @@ def main():
     ap.add_argument("--save-dir", type=str, default=None, help="where to save best genomes (default=outdir)")
     ap.add_argument("--save-best-every", type=int, default=1, help="save best genome every N generations (0=off)")
     ap.add_argument("--checkpointer", type=int, default=0, help="save full NEAT state every N generations (0=off)")
+    ap.add_argument("--train-seeds-per-gen", type=int, default=3,
+                    help="number of random tracks per genome evaluation")
+    ap.add_argument("--seed-range", type=int, default=100000,
+                    help="track seeds sampled uniformly from [0, seed-range)")
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -168,19 +222,27 @@ def main():
 
     t0 = time.time()
     for gen in range(args.gens):
-        track = replay_track if args.fixed_track else make_track(seed=np.random.randint(0, 10_000))
+        fixed_track = replay_track if args.fixed_track else None
+        max_time = 10.0 if (args.train_seeds_per_gen > 1 and not args.fixed_track) else 12.0
+        EVAL_CONTEXT.update({
+            "fixed_track": fixed_track,
+            "train_seeds_per_gen": max(1, int(args.train_seeds_per_gen)),
+            "seed_range": int(args.seed_range),
+            "base_seed": int(args.seed),
+            "gen_idx": int(gen),
+            "max_time": float(max_time),
+        })
 
         # Evaluate
         if args.parallel:
             from neat.parallel import ParallelEvaluator
             import os as _os
-            pe = ParallelEvaluator(_os.cpu_count() or 4,
-                                   lambda genome, _cfg: eval_one_genome(genome, _cfg, track, max_time=12.0))
+            pe = ParallelEvaluator(_os.cpu_count() or 4, eval_genome_multi)
             pe.evaluate(list(pop.population.items()))  # fills genome.fitness
         else:
             genomes = list(pop.population.items())
             for gid, genome in genomes:
-                genome.fitness = eval_one_genome(genome, cfg, track, max_time=12.0)
+                genome.fitness = eval_genome_multi(genome, cfg)
 
         # Log
         scores = [g.fitness for g in pop.population.values()]
